@@ -448,3 +448,511 @@ def sigma_plus_minus_along_n(n):
     sigma_minus_n = U @ sigma_minus_z @ U.conj().T
 
     return sigma_plus_n, sigma_minus_n
+
+
+
+#-----------------------------------------
+# Variational AGP calculations
+#-----------------------------------------
+
+#Evaluating dissipators on the steady state
+def dissipator_actions(
+    rho_ss: np.ndarray,
+    jump_operators,
+) -> np.ndarray:
+    """
+    Return
+
+        O_j = D[L_j](rho_ss)
+
+    for every jump operator L_j.
+
+    Returns
+    -------
+    O : ndarray, shape (n_jumps, d, d)
+        O[j] = D[L_j](rho_ss).
+    """
+    rho_ss = np.asarray(rho_ss, dtype=np.complex128)
+
+    if rho_ss.ndim != 2 or rho_ss.shape[0] != rho_ss.shape[1]:
+        raise ValueError("rho_ss must be a square matrix.")
+
+    d = rho_ss.shape[0]
+    jump_operators = tuple(jump_operators)
+
+    O = np.empty(
+        (len(jump_operators), d, d),
+        dtype=np.complex128,
+    )
+
+    for j, L in enumerate(jump_operators):
+        L = np.asarray(L, dtype=np.complex128)
+
+        if L.shape != (d, d):
+            raise ValueError(
+                f"jump_operators[{j}] has shape {L.shape}; "
+                f"expected {(d, d)}."
+            )
+
+        Ldag = L.conj().T
+        LdagL = Ldag @ L
+
+        O[j] = (
+            L @ rho_ss @ Ldag
+            - 0.5 * (LdagL @ rho_ss + rho_ss @ LdagL)
+        )
+
+    return O
+
+#Finding rotational part of the AGP variationally
+def var_AGP_Urot(
+    rho_ss: np.ndarray,
+    partial_s_rho_ss: np.ndarray,
+    hamiltonians,
+    lam: float = 0.0,
+    *,
+    rcond: float = 1e-12,
+    return_details: bool = False,
+):
+    """
+    Fit a signed Hamiltonian counterdiabatic term
+
+        H_CD = sum_j x_j H_j
+
+    by minimising
+
+        || partial_s_rho_ss + i sum_j x_j [H_j, rho_ss] ||_F^2
+        + lam * ||x||_2^2,
+
+    where x_j are real and may have either sign.
+
+    For lam = 0, this returns the Moore-Penrose minimum-norm
+    least-squares solution.
+
+    Parameters
+    ----------
+    rho_ss : ndarray, shape (d, d)
+        Instantaneous steady-state density matrix.
+
+    partial_s_rho_ss : ndarray, shape (d, d)
+        Derivative partial_s rho_ss.
+
+    hamiltonians : sequence of ndarray
+        Candidate Hermitian operators H_j.
+
+    lam : float, optional
+        Non-negative Tikhonov regularisation strength.
+        lam = 0 gives the Moore-Penrose solution.
+
+    rcond : float, optional
+        Singular-value cutoff used by np.linalg.pinv when lam = 0.
+
+    return_details : bool, optional
+        If True, also return diagnostic quantities.
+
+    Returns
+    -------
+    x : ndarray, shape (n_hamiltonians,)
+        Optimal real, signed Hamiltonian coefficients.
+
+    residual : ndarray, shape (d, d)
+        Residual at the optimum:
+
+            partial_s_rho_ss + i sum_j x_j [H_j, rho_ss].
+
+    details : dict, optional
+        Returned only if return_details=True.
+    """
+    rho_ss = np.asarray(rho_ss, dtype=np.complex128)
+    partial_s_rho_ss = np.asarray(
+        partial_s_rho_ss,
+        dtype=np.complex128,
+    )
+    hamiltonians = tuple(
+        np.asarray(H, dtype=np.complex128)
+        for H in hamiltonians
+    )
+
+    if rho_ss.ndim != 2 or rho_ss.shape[0] != rho_ss.shape[1]:
+        raise ValueError("rho_ss must be a square matrix.")
+
+    if partial_s_rho_ss.shape != rho_ss.shape:
+        raise ValueError(
+            "partial_s_rho_ss must have the same shape as rho_ss."
+        )
+
+    if len(hamiltonians) == 0:
+        raise ValueError("At least one Hamiltonian is required.")
+
+    if lam < 0:
+        raise ValueError("lam must be non-negative.")
+
+    if any(H.shape != rho_ss.shape for H in hamiltonians):
+        raise ValueError(
+            "Every Hamiltonian must have the same shape as rho_ss."
+        )
+
+    # C_j = i [H_j, rho_ss].
+    #
+    # The residual is:
+    #
+    #     R = partial_s_rho_ss + sum_j x_j C_j.
+    commutator_actions = np.array([
+        1j * (H @ rho_ss - rho_ss @ H)
+        for H in hamiltonians
+    ])
+
+    A_complex = np.column_stack([
+        C_j.reshape(-1, order="F")
+        for C_j in commutator_actions
+    ])
+    d_complex = partial_s_rho_ss.reshape(-1, order="F")
+
+    # x must be real, so represent the complex Frobenius norm as a
+    # real Euclidean norm.
+    A_real = np.vstack([A_complex.real, A_complex.imag])
+    d_real = np.concatenate([d_complex.real, d_complex.imag])
+
+    # Minimise ||A_real @ x + d_real||^2 + lam ||x||^2.
+    if lam == 0.0:
+        # Moore-Penrose, minimum-norm least-squares solution.
+        x = -np.linalg.pinv(A_real, rcond=rcond) @ d_real
+    else:
+        # Tikhonov-regularised signed least squares.
+        normal_matrix = A_real.T @ A_real + lam * np.eye(len(hamiltonians))
+        rhs = -A_real.T @ d_real
+        x = np.linalg.solve(normal_matrix, rhs)
+
+    residual = partial_s_rho_ss + np.tensordot(
+        x,
+        commutator_actions,
+        axes=(0, 0),
+    )
+
+    if not return_details:
+        return x, residual
+
+    residual_norm_squared = float(np.vdot(residual, residual).real)
+    x_norm_squared = float(x @ x)
+
+    details = {
+        "residual_norm_squared": residual_norm_squared,
+        "x_norm_squared": x_norm_squared,
+        "objective": residual_norm_squared + lam * x_norm_squared,
+        "commutator_actions": commutator_actions,
+        "fitted_hamiltonian": sum(
+            coefficient * H
+            for coefficient, H in zip(x, hamiltonians)
+        ),
+    }
+
+    return x, residual, details
+
+#Finding dissipative part of the AGP variationally
+def var_AGP_Dpop(
+    rho_ss: np.ndarray,
+    target: np.ndarray,
+    jump_operators,
+    lam: float = 0.0,
+    *,
+    return_details: bool = False,
+    verbose: bool = False,
+):
+    """
+    Solve the regularised non-negative least-squares problem
+
+        min_{gamma_j >= 0}
+            ||sum_j gamma_j D[L_j](rho_ss)
+              - target||_F^2
+            + lam * ||gamma||_2^2.
+
+    Parameters
+    ----------
+    rho_ss : ndarray, shape (d, d)
+        Instantaneous steady state.
+
+    target : ndarray, shape (d, d)
+        This is generally the residual after we minimise the norm of the unitary part, need to mop up what's left with the dissipator.
+
+    jump_operators : sequence of ndarray
+        Candidate jump operators L_j.
+
+    lam : float, optional
+        Non-negative L2 regularisation parameter.
+
+    return_details : bool, optional
+        If False, return only gamma.
+        If True, also return diagnostic quantities and Jump objects.
+
+    verbose : bool, optional
+        Print the fitted norms. Off by default.
+
+    Returns
+    -------
+    gamma : ndarray, shape (n_jumps,)
+        Optimal non-negative rates.
+
+    details : dict, optional
+        Returned only when return_details=True.
+    """
+    rho_ss = np.asarray(rho_ss, dtype=np.complex128)
+    target = np.asarray(
+        target,
+        dtype=np.complex128,
+    )
+    jump_operators = tuple(jump_operators)
+
+    if rho_ss.ndim != 2 or rho_ss.shape[0] != rho_ss.shape[1]:
+        raise ValueError("rho_ss must be a square matrix.")
+
+    if target.shape != rho_ss.shape:
+        raise ValueError(
+            "target must have the same shape as rho_ss."
+        )
+
+    if lam < 0.0:
+        raise ValueError("lam must be non-negative.")
+
+    if len(jump_operators) == 0:
+        raise ValueError("At least one jump operator is required.")
+
+    # O_j = D[L_j](rho_ss)
+    O = dissipator_actions(rho_ss, jump_operators)
+
+    # Construct the complex design matrix:
+    #
+    #     A[:, j] = vec(O_j)
+    #
+    # using the same column-major convention as LiouvillianBuilder.
+    A_complex = np.column_stack([
+        O_j.reshape(-1, order="F")
+        for O_j in O
+    ])
+
+    b_complex = target.reshape(-1, order="F")
+
+    # gamma is real, so convert the complex least-squares problem into
+    # an equivalent real one.
+    A_real = np.vstack([
+        A_complex.real,
+        A_complex.imag,
+    ])
+    b_real = np.concatenate([
+        b_complex.real,
+        b_complex.imag,
+    ])
+
+    n_jumps = len(jump_operators)
+
+    # Tikhonov regularisation:
+    #
+    # ||A gamma - b||^2 + lam ||gamma||^2
+    #
+    # becomes the augmented NNLS problem
+    #
+    # || [A; sqrt(lam) I] gamma - [b; 0] ||^2.
+    if lam > 0.0:
+        A_fit = np.vstack([
+            A_real,
+            np.sqrt(lam) * np.eye(n_jumps),
+        ])
+        b_fit = np.concatenate([
+            b_real,
+            np.zeros(n_jumps),
+        ])
+    else:
+        A_fit = A_real
+        b_fit = b_real
+
+    gamma, _ = nnls(A_fit, b_fit)
+
+    if not return_details and not verbose:
+        return gamma
+
+    fitted_derivative = np.tensordot(
+        gamma,
+        O,
+        axes=(0, 0),
+    )
+
+    residual = fitted_derivative - target
+
+    residual_norm_squared = float(
+        np.vdot(residual, residual).real
+    )
+    gamma_norm_squared = float(gamma @ gamma)
+    objective = (
+        residual_norm_squared
+        + lam * gamma_norm_squared
+    )
+
+    if verbose:
+        print("Residual norm squared:", residual_norm_squared)
+        print("Gamma norm squared:", gamma_norm_squared)
+        print("Regularised objective:", objective)
+
+    if not return_details:
+        return gamma
+
+    details = {
+        "residual_norm_squared": residual_norm_squared,
+        "gamma_norm_squared": gamma_norm_squared,
+        "objective": objective,
+        "fitted_derivative": fitted_derivative,
+        "dissipator_actions": O,
+
+        # Directly compatible with builder.build(H, jumps).
+        "weighted_jumps": [
+            Jump(L, rate)
+            for L, rate in zip(jump_operators, gamma)
+        ],
+
+        # Keeps the correspondence between rate, operator, and action.
+        "terms": [
+            {
+                "gamma": gamma[j],
+                "L": jump_operators[j],
+                "O": O[j],
+            }
+            for j in range(n_jumps)
+        ],
+    }
+
+    return gamma, details
+
+#Finding the overall AGP variationally
+def fit_overall_AGP(
+    rho_ss: np.ndarray,
+    partial_s_rho_ss: np.ndarray,
+    hamiltonians,
+    jump_operators,
+    *,
+    lam_unitary: float = 0.0,
+    lam_dissipative: float = 0.0,
+    rcond: float = 1e-12,
+    return_details: bool = False,
+):
+    """
+    Sequentially fit a Hamiltonian and dissipative AGP.
+
+    Step 1: fit the signed unitary contribution
+
+        partial_s rho_ss + i sum_j x_j [H_j, rho_ss] ~ 0.
+
+    Step 2: let positive dissipative rates reproduce the remaining
+    unitary residual:
+
+        sum_k gamma_k D[L_k](rho_ss) ~ residual_unitary,
+
+    where
+
+        residual_unitary
+        = partial_s rho_ss + i sum_j x_j [H_j, rho_ss].
+
+    Thus the final residual, in this convention, is
+
+        residual_total
+        = residual_unitary - sum_k gamma_k D[L_k](rho_ss).
+
+    Parameters
+    ----------
+    rho_ss, partial_s_rho_ss : ndarray
+        Instantaneous steady state and its derivative.
+
+    hamiltonians : sequence of ndarray
+        Candidate Hermitian terms H_j.
+
+    jump_operators : sequence of ndarray
+        Candidate jump operators L_k.
+
+    lam_unitary, lam_dissipative : float
+        L2 regularisation strengths for x and gamma respectively.
+
+    rcond : float
+        Pseudoinverse cutoff for the unitary fit.
+
+    return_details : bool
+        If False, return (x, gamma, residual_total).
+        If True, additionally return a diagnostics dictionary.
+
+    Returns
+    -------
+    x : ndarray
+        Signed coefficients of the Hamiltonian terms.
+
+    gamma : ndarray
+        Non-negative coefficients of the dissipative terms.
+
+    residual_total : ndarray
+        Remaining residual after both fits.
+    """
+    # ---------------------------------------------------------------
+    # 1. Unitary contribution:
+    #
+    # R_U = partial_s rho_ss + i sum_j x_j [H_j, rho_ss].
+    # ---------------------------------------------------------------
+    x, residual_unitary, unitary_details = var_AGP_Urot(
+        rho_ss=rho_ss,
+        partial_s_rho_ss=partial_s_rho_ss,
+        hamiltonians=hamiltonians,
+        lam=lam_unitary,
+        rcond=rcond,
+        return_details=True,
+    )
+
+    # ---------------------------------------------------------------
+    # 2. Dissipative contribution:
+    #
+    # Find D_fit = sum_k gamma_k D[L_k](rho_ss) ~= R_U.
+    # ---------------------------------------------------------------
+    gamma, dissipative_details = var_AGP_Dpop(
+        rho_ss=rho_ss,
+        target=residual_unitary,
+        jump_operators=jump_operators,
+        lam=lam_dissipative,
+        return_details=True,
+    )
+
+    fitted_dissipative_derivative = (
+        dissipative_details["fitted_derivative"]
+    )
+
+    # var_AGP_Dpop defines its own residual as D_fit - R_U.
+    # Here we use the physically clearer opposite convention:
+    #
+    # R_total = R_U - D_fit.
+    residual_total = (
+        residual_unitary - fitted_dissipative_derivative
+    )
+
+    if not return_details:
+        return x, gamma, residual_total
+
+    total_residual_norm_squared = float(
+        np.vdot(residual_total, residual_total).real
+    )
+
+    details = {
+        "x": x,
+        "gamma": gamma,
+
+        "residual_unitary": residual_unitary,
+        "residual_unitary_norm_squared": float(
+            np.vdot(residual_unitary, residual_unitary).real
+        ),
+
+        "fitted_dissipative_derivative":
+            fitted_dissipative_derivative,
+
+        "residual_total": residual_total,
+        "residual_total_norm_squared":
+            total_residual_norm_squared,
+
+        "unitary": unitary_details,
+        "dissipative": dissipative_details,
+
+        "H_agp": unitary_details["fitted_hamiltonian"],
+        "weighted_jumps": dissipative_details["weighted_jumps"],
+    }
+
+    return x, gamma, residual_total, details
