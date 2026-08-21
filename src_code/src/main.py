@@ -956,3 +956,183 @@ def fit_overall_AGP(
     }
 
     return x, gamma, residual_total, details
+
+
+#----------------------------------------
+# Evolving rho in time w/ approx CD driving
+#----------------------------------------
+def approx_CD_trajectory(
+    model,
+    s_of_t,
+    times,
+    hamiltonians,
+    jump_operators,
+    *,
+    dim=2,
+    vec_order="F",
+    lam_unitary=0.0,
+    lam_dissipative=0.0,
+):
+    """
+    Evolve the instantaneous steady state under the approximate
+    counterdiabatic Lindbladian
+
+        L_CD(t) = L(s(t)) + sdot(t) A_s.
+
+    Here `model` is interpreted as a function of s:
+        model.H(s)
+        model.jumps(s)
+
+    The AGP is calculated variationally on the supplied time grid
+    and linearly interpolated between grid points.
+
+    Returns
+    -------
+    t : ndarray
+        Time grid.
+
+    traj : Trajectory
+        Trajectory object from LindbladEvolver.
+
+    rho_t : ndarray, shape (nt, d, d)
+        CD-evolved density matrices.
+
+    rho_ss_t : ndarray, shape (nt, d, d)
+        Instantaneous steady states rho_ss(s(t)).
+    """
+
+    # --------------------------------------------------
+    # Grid and builder
+    # --------------------------------------------------
+
+    t = np.asarray(times, dtype=float)
+    s_t = np.array([s_of_t(tt) for tt in t], dtype=float)
+
+    builder = LiouvillianBuilder(
+        dim=dim,
+        vec_order=vec_order,
+    )
+
+    # --------------------------------------------------
+    # Instantaneous steady states
+    # --------------------------------------------------
+
+    rho_ss_t = np.array([
+        get_steady_state(builder, model, s)
+        for s in s_t
+    ])
+
+    # partial_s rho_ss and sdot
+    drho_ds_t = np.gradient(
+        rho_ss_t,
+        s_t,
+        axis=0,
+        edge_order=2 if len(t) >= 3 else 1,
+    )
+
+    sdot_t = np.gradient(
+        s_t,
+        t,
+        edge_order=2 if len(t) >= 3 else 1,
+    )
+
+    # --------------------------------------------------
+    # Variational AGP on the grid
+    # --------------------------------------------------
+
+    H_agp_t = []
+    gamma_agp_t = []
+
+    for rho_ss, drho_ds in zip(rho_ss_t, drho_ds_t):
+
+        _, gamma, _, details = fit_overall_AGP(
+            rho_ss=rho_ss,
+            partial_s_rho_ss=drho_ds,
+            hamiltonians=hamiltonians,
+            jump_operators=jump_operators,
+            lam_unitary=lam_unitary,
+            lam_dissipative=lam_dissipative,
+            return_details=True,
+        )
+
+        H_agp_t.append(details["H_agp"])
+        gamma_agp_t.append(gamma)
+
+    H_agp_t = np.asarray(H_agp_t)
+    gamma_agp_t = np.asarray(gamma_agp_t)
+
+    # --------------------------------------------------
+    # Linear interpolation
+    # --------------------------------------------------
+
+    def interp(tt, values):
+        if tt <= t[0]:
+            return values[0]
+        if tt >= t[-1]:
+            return values[-1]
+
+        k = np.searchsorted(t, tt) - 1
+        a = (tt - t[k]) / (t[k + 1] - t[k])
+
+        return (1 - a) * values[k] + a * values[k + 1]
+
+    # --------------------------------------------------
+    # CD model:
+    #
+    # H -> H + sdot H_AGP
+    # gamma_j -> sdot gamma_j
+    # --------------------------------------------------
+
+    def H_CD_of_t(tt):
+
+        s = s_of_t(tt)
+        sdot = interp(tt, sdot_t)
+        H_agp = interp(tt, H_agp_t)
+
+        return model.H(s) + sdot * H_agp
+
+    def jumps_CD_of_t(tt):
+
+        s = s_of_t(tt)
+        sdot = interp(tt, sdot_t)
+        gamma = interp(tt, gamma_agp_t)
+
+        # Original physical jumps
+        jumps = list(model.jumps(s))
+
+        # Counterdiabatic dissipative terms
+        jumps += [
+            Jump(L, sdot * g)
+            for L, g in zip(jump_operators, gamma)
+        ]
+
+        return jumps
+
+    CD_model = LindbladModel2LS(
+        H_CD_of_t,
+        jumps_CD_of_t,
+    )
+
+    # --------------------------------------------------
+    # Start in rho_ss(s(t0)) and use existing evolver
+    # --------------------------------------------------
+
+    rho0 = rho_ss_t[0]
+
+    evolver = LindbladEvolver(
+        CD_model,
+        builder,
+    )
+
+    traj = evolver.simulate(
+        rho0,
+        t,
+    )
+
+    # Density matrices along the actual CD trajectory
+    rho_t = np.array([
+        traj.rho(k)
+        for k in range(len(traj.t))
+    ])
+
+    return t, traj, rho_t, rho_ss_t
