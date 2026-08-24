@@ -17,6 +17,7 @@ This module provides:
 import numpy as np
 from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
+from scipy.optimize import nnls
 
 
 
