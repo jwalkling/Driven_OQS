@@ -19,6 +19,8 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 from scipy.optimize import nnls
 
+from dataclasses import dataclass
+
 
 
 #-----------------------------------
@@ -281,6 +283,7 @@ def bloch_to_operator(v):
 # Steady state calculations
 #------------------------------------
 
+# Calculate the instantaneous steady state by diagonalising L(t)
 def get_steady_state(builder, model, t: float, *, normalize_trace: bool = True, return_eval: bool = False):
     """
     Compute the instantaneous steady-state density matrix for the Lindbladian
@@ -335,6 +338,54 @@ def get_steady_state(builder, model, t: float, *, normalize_trace: bool = True, 
     if return_eval:
         return rho_ss, evals[idx]
     return rho_ss
+
+# Get the instantaneous stedy state and its discrete derivative on a grid of values
+def calculate_steady_state_path(
+    builder,
+    model,
+    s_grid,
+    *,
+    drho_ds_of_s=None,
+):
+    """
+    Calculate rho_ss(s) and d_s rho_ss(s).
+
+    If drho_ds_of_s is supplied, use the analytic derivative.
+    Otherwise use finite differences.
+    """
+    s_grid = np.asarray(s_grid, dtype=float)
+
+    rho_ss = np.asarray([
+        get_steady_state(builder, model, s)
+        for s in s_grid
+    ])
+
+    if drho_ds_of_s is not None:
+        drho_ds = np.asarray([
+            drho_ds_of_s(s)
+            for s in s_grid
+        ])
+
+        return rho_ss, drho_ds
+
+    if np.any(np.isclose(np.diff(s_grid), 0.0)):
+        raise ValueError(
+            "Repeated neighbouring parameter values prevent "
+            "numerical differentiation with respect to s."
+        )
+
+    edge_order = 2 if len(s_grid) >= 3 else 1
+
+    drho_ds = np.gradient(
+        rho_ss,
+        s_grid,
+        axis=0,
+        edge_order=edge_order,
+    )
+
+    return rho_ss, drho_ds
+
+
 
 def get_steady_state_zz_of_t(builder, model, t: np.ndarray):
     """
@@ -451,6 +502,22 @@ def sigma_plus_minus_along_n(n):
     return sigma_plus_n, sigma_minus_n
 
 
+#-----------------------------------------
+# Function to evolve the density matrix under the Lindblad master equation
+#-----------------------------------------
+def evolve_density_matrices(model, builder, rho0, times):
+    """
+    Evolve rho0 and return both the Trajectory and density matrices.
+    """
+    evolver = LindbladEvolver(model, builder)
+    traj = evolver.simulate(rho0, times)
+
+    rho_t = np.asarray([
+        traj.rho(k)
+        for k in range(len(traj.t))
+    ])
+
+    return traj, rho_t
 
 #-----------------------------------------
 # Variational AGP calculations
@@ -959,9 +1026,295 @@ def fit_overall_AGP(
     return x, gamma, residual_total, details
 
 
-#----------------------------------------
-# Evolving rho in time w/ approx CD driving
-#----------------------------------------
+# ============================================================
+# Define discrete variational AGP data container
+# ------------------------------------------------------------
+@dataclass
+class AGPGridData:
+    x: np.ndarray
+    H_agp: np.ndarray
+    gamma: np.ndarray
+
+    residual_matrix: np.ndarray
+    residual_norm: np.ndarray
+    residual_norm_squared: np.ndarray
+
+    unitary_residual_norm: np.ndarray
+    unitary_residual_norm_squared: np.ndarray
+
+
+# ============================================================
+# Sample a driving protocol
+# ============================================================
+
+def sample_protocol(s_of_t, times, *, sdot_of_t=None):
+    """
+    Evaluate s(t) and sdot(t) on a time grid.
+
+    If an analytic sdot_of_t is supplied, use it. Otherwise calculate
+    sdot numerically.
+    """
+    t = np.asarray(times, dtype=float)
+
+    if t.ndim != 1 or len(t) < 2:
+        raise ValueError("times must be a one-dimensional grid.")
+
+    if np.any(np.diff(t) <= 0):
+        raise ValueError("times must be strictly increasing.")
+
+    s_t = np.asarray([s_of_t(tt) for tt in t], dtype=float)
+
+    if sdot_of_t is None:
+        edge_order = 2 if len(t) >= 3 else 1
+        sdot_t = np.gradient(
+            s_t,
+            t,
+            edge_order=edge_order,
+        )
+    else:
+        sdot_t = np.asarray([
+            sdot_of_t(tt)
+            for tt in t
+        ])
+
+    return t, s_t, sdot_t
+
+
+# ============================================================
+# Calculation of AGP and counterdiabatic Lindbladian on a grid
+# ============================================================
+def fit_agp_grid(
+    rho_ss_grid,
+    drho_ds_grid,
+    hamiltonians,
+    jump_operators,
+    *,
+    lam_unitary=0.0,
+    lam_dissipative=0.0,
+    rcond=1e-12,
+):
+    """
+    Apply fit_overall_AGP independently at every parameter value.
+    """
+    x_grid = []
+    H_agp_grid = []
+    gamma_grid = []
+
+    residual_grid = []
+    residual_norm_squared = []
+    unitary_residual_norm_squared = []
+
+    for rho_ss, drho_ds in zip(rho_ss_grid, drho_ds_grid):
+        x, gamma, residual, details = fit_overall_AGP(
+            rho_ss=rho_ss,
+            partial_s_rho_ss=drho_ds,
+            hamiltonians=hamiltonians,
+            jump_operators=jump_operators,
+            lam_unitary=lam_unitary,
+            lam_dissipative=lam_dissipative,
+            rcond=rcond,
+            return_details=True,
+        )
+
+        x_grid.append(x)
+        H_agp_grid.append(details["H_agp"])
+        gamma_grid.append(gamma)
+
+        residual_grid.append(residual)
+        residual_norm_squared.append(
+            details["residual_total_norm_squared"]
+        )
+        unitary_residual_norm_squared.append(
+            details["residual_unitary_norm_squared"]
+        )
+
+    residual_norm_squared = np.asarray(
+        residual_norm_squared
+    )
+    unitary_residual_norm_squared = np.asarray(
+        unitary_residual_norm_squared
+    )
+
+    return AGPGridData(
+        x=np.asarray(x_grid),
+        H_agp=np.asarray(H_agp_grid),
+        gamma=np.asarray(gamma_grid),
+
+        residual_matrix=np.asarray(residual_grid),
+        residual_norm=np.sqrt(
+            np.maximum(residual_norm_squared, 0.0)
+        ),
+        residual_norm_squared=residual_norm_squared,
+
+        unitary_residual_norm=np.sqrt(
+            np.maximum(unitary_residual_norm_squared, 0.0)
+        ),
+        unitary_residual_norm_squared=(
+            unitary_residual_norm_squared
+        ),
+    )
+
+def interpolate_time_grid(t, values, tt):
+    """
+    Linearly interpolate scalar-, vector-, or matrix-valued data.
+    """
+    if tt <= t[0]:
+        return values[0]
+
+    if tt >= t[-1]:
+        return values[-1]
+
+    k = np.searchsorted(t, tt) - 1
+    weight = (tt - t[k]) / (t[k + 1] - t[k])
+
+    return (
+        (1.0 - weight) * values[k]
+        + weight * values[k + 1]
+    )
+
+def build_interpolated_cd_model(
+    model,
+    s_of_t,
+    times,
+    sdot_grid,
+    agp_data,
+    jump_operators,
+    *,
+    rate_tolerance=1e-12,
+):
+    """
+    Construct
+
+        H_CD(t) = H(s(t)) + sdot(t) H_AGP(s(t))
+
+    together with positive dissipative CD rates.
+    """
+    t = np.asarray(times, dtype=float)
+
+    def H_CD_of_t(tt):
+        s = s_of_t(tt)
+
+        sdot = interpolate_time_grid(
+            t,
+            sdot_grid,
+            tt,
+        )
+        H_agp = interpolate_time_grid(
+            t,
+            agp_data.H_agp,
+            tt,
+        )
+
+        return model.H(s) + sdot * H_agp
+
+    def jumps_CD_of_t(tt):
+        s = s_of_t(tt)
+
+        sdot = interpolate_time_grid(
+            t,
+            sdot_grid,
+            tt,
+        )
+        gamma = interpolate_time_grid(
+            t,
+            agp_data.gamma,
+            tt,
+        )
+
+        jumps = list(model.jumps(s))
+
+        for L, g in zip(jump_operators, gamma):
+            rate = sdot * g
+
+            if rate < -rate_tolerance:
+                raise ValueError(
+                    f"Negative CD rate {rate:.6g}; "
+                    "the generator is not GKSL."
+                )
+
+            if rate > rate_tolerance:
+                jumps.append(Jump(L, rate))
+
+        return jumps
+
+    return LindbladModel2LS(
+        H_CD_of_t,
+        jumps_CD_of_t,
+    )
+
+def plot_agp_residuals(
+    s_grid,
+    agp_data,
+    *,
+    logscale=False,
+):
+    fig, ax = plt.subplots(
+        figsize=(6.0, 4.0),
+        constrained_layout=True,
+    )
+
+    ax.plot(
+        s_grid,
+        agp_data.unitary_residual_norm,
+        "--",
+        linewidth=2.0,
+        label="after unitary fit",
+    )
+    ax.plot(
+        s_grid,
+        agp_data.residual_norm,
+        linewidth=2.2,
+        label="after full AGP fit",
+    )
+
+    ax.set_xlabel(r"$s$")
+    ax.set_ylabel(r"$\|R_{\rm AGP}(s)\|_F$")
+    ax.set_title("Variational AGP residual")
+
+    if logscale:
+        ax.set_yscale("log")
+
+    ax.legend(frameon=False)
+
+    return fig, ax
+
+def print_agp_diagnostics(s_grid, sdot_grid, agp_data):
+    max_x = (
+        np.max(np.abs(agp_data.x))
+        if agp_data.x.size
+        else 0.0
+    )
+
+    max_gamma = (
+        np.max(agp_data.gamma)
+        if agp_data.gamma.size
+        else 0.0
+    )
+
+    max_H_coefficient = (
+        np.max(
+            np.abs(sdot_grid[:, None] * agp_data.x)
+        )
+        if agp_data.x.size
+        else 0.0
+    )
+
+    max_jump_rate = (
+        np.max(
+            np.abs(sdot_grid[:, None] * agp_data.gamma)
+        )
+        if agp_data.gamma.size
+        else 0.0
+    )
+
+    print("Minimum parameter spacing:", np.min(np.abs(np.diff(s_grid))))
+    print("Maximum |sdot|:", np.max(np.abs(sdot_grid)))
+    print("Maximum |x|:", max_x)
+    print("Maximum gamma:", max_gamma)
+    print("Maximum physical Hamiltonian coefficient:", max_H_coefficient)
+    print("Maximum physical CD jump rate:", max_jump_rate)
+    print("Maximum variational residual:", np.max(agp_data.residual_norm))
+
 def approx_CD_trajectory(
     model,
     s_of_t,
@@ -971,169 +1324,267 @@ def approx_CD_trajectory(
     *,
     dim=2,
     vec_order="F",
-    lam_unitary=0.0,
-    lam_dissipative=0.0,
+    sdot_of_t=None,
+    drho_ds_of_s=None,
+    lam_unitary=1e-12,
+    lam_dissipative=1e-12,
+    rcond=1e-12,
+    plot_residual=False,
+    residual_logscale=False,
+    verbose=False,
 ):
     """
-    Evolve the instantaneous steady state under the approximate
-    counterdiabatic Lindbladian
-
-        L_CD(t) = L(s(t)) + sdot(t) A_s.
-
-    Here `model` is interpreted as a function of s:
-        model.H(s)
-        model.jumps(s)
-
-    The AGP is calculated variationally on the supplied time grid
-    and linearly interpolated between grid points.
-
-    Returns
-    -------
-    t : ndarray
-        Time grid.
-
-    traj : Trajectory
-        Trajectory object from LindbladEvolver.
-
-    rho_t : ndarray, shape (nt, d, d)
-        CD-evolved density matrices.
-
-    rho_ss_t : ndarray, shape (nt, d, d)
-        Instantaneous steady states rho_ss(s(t)).
+    Calculate a variational AGP and evolve the CD-corrected model.
     """
-
-    # --------------------------------------------------
-    # Grid and builder
-    # --------------------------------------------------
-
-    t = np.asarray(times, dtype=float)
-    s_t = np.array([s_of_t(tt) for tt in t], dtype=float)
-
     builder = LiouvillianBuilder(
         dim=dim,
         vec_order=vec_order,
     )
 
-    # --------------------------------------------------
-    # Instantaneous steady states
-    # --------------------------------------------------
+    t, s_t, sdot_t = sample_protocol(
+        s_of_t,
+        times,
+        sdot_of_t=sdot_of_t,
+    )
 
-    rho_ss_t = np.array([
-        get_steady_state(builder, model, s)
-        for s in s_t
-    ])
+    rho_ss_t, drho_ds_t = calculate_steady_state_path(
+        builder,
+        model,
+        s_t,
+        drho_ds_of_s=drho_ds_of_s,
+    )
 
-    # partial_s rho_ss and sdot
-    drho_ds_t = np.gradient(
+    agp_data = fit_agp_grid(
         rho_ss_t,
-        s_t,
-        axis=0,
-        edge_order=2 if len(t) >= 3 else 1,
+        drho_ds_t,
+        hamiltonians,
+        jump_operators,
+        lam_unitary=lam_unitary,
+        lam_dissipative=lam_dissipative,
+        rcond=rcond,
     )
 
-    sdot_t = np.gradient(
-        s_t,
-        t,
-        edge_order=2 if len(t) >= 3 else 1,
-    )
-
-    # --------------------------------------------------
-    # Variational AGP on the grid
-    # --------------------------------------------------
-
-    H_agp_t = []
-    gamma_agp_t = []
-
-    for rho_ss, drho_ds in zip(rho_ss_t, drho_ds_t):
-
-        _, gamma, _, details = fit_overall_AGP(
-            rho_ss=rho_ss,
-            partial_s_rho_ss=drho_ds,
-            hamiltonians=hamiltonians,
-            jump_operators=jump_operators,
-            lam_unitary=lam_unitary,
-            lam_dissipative=lam_dissipative,
-            return_details=True,
+    if verbose:
+        print_agp_diagnostics(
+            s_t,
+            sdot_t,
+            agp_data,
         )
 
-        H_agp_t.append(details["H_agp"])
-        gamma_agp_t.append(gamma)
+    if plot_residual:
+        plot_agp_residuals(
+            s_t,
+            agp_data,
+            logscale=residual_logscale,
+        )
+        plt.show()
 
-    H_agp_t = np.asarray(H_agp_t)
-    gamma_agp_t = np.asarray(gamma_agp_t)
-
-    # --------------------------------------------------
-    # Linear interpolation
-    # --------------------------------------------------
-
-    def interp(tt, values):
-        if tt <= t[0]:
-            return values[0]
-        if tt >= t[-1]:
-            return values[-1]
-
-        k = np.searchsorted(t, tt) - 1
-        a = (tt - t[k]) / (t[k + 1] - t[k])
-
-        return (1 - a) * values[k] + a * values[k + 1]
-
-    # --------------------------------------------------
-    # CD model:
-    #
-    # H -> H + sdot H_AGP
-    # gamma_j -> sdot gamma_j
-    # --------------------------------------------------
-
-    def H_CD_of_t(tt):
-
-        s = s_of_t(tt)
-        sdot = interp(tt, sdot_t)
-        H_agp = interp(tt, H_agp_t)
-
-        return model.H(s) + sdot * H_agp
-
-    def jumps_CD_of_t(tt):
-
-        s = s_of_t(tt)
-        sdot = interp(tt, sdot_t)
-        gamma = interp(tt, gamma_agp_t)
-
-        # Original physical jumps
-        jumps = list(model.jumps(s))
-
-        # Counterdiabatic dissipative terms
-        jumps += [
-            Jump(L, sdot * g)
-            for L, g in zip(jump_operators, gamma)
-        ]
-
-        return jumps
-
-    CD_model = LindbladModel2LS(
-        H_CD_of_t,
-        jumps_CD_of_t,
+    CD_model = build_interpolated_cd_model(
+        model,
+        s_of_t,
+        t,
+        sdot_t,
+        agp_data,
+        jump_operators,
     )
 
-    # --------------------------------------------------
-    # Start in rho_ss(s(t0)) and use existing evolver
-    # --------------------------------------------------
-
-    rho0 = rho_ss_t[0]
-
-    evolver = LindbladEvolver(
+    traj, rho_t = evolve_density_matrices(
         CD_model,
         builder,
-    )
-
-    traj = evolver.simulate(
-        rho0,
+        rho_ss_t[0],
         t,
     )
 
-    # Density matrices along the actual CD trajectory
-    rho_t = np.array([
-        traj.rho(k)
-        for k in range(len(traj.t))
-    ])
+    diagnostics = {
+        "s": s_t,
+        "sdot": sdot_t,
+        "rho_ss": rho_ss_t,
+        "drho_ds": drho_ds_t,
+        "x": agp_data.x,
+        "H_agp": agp_data.H_agp,
+        "gamma": agp_data.gamma,
+        "residual_matrix": agp_data.residual_matrix,
+        "residual_norm": agp_data.residual_norm,
+        "residual_norm_squared": agp_data.residual_norm_squared,
+        "unitary_residual_norm":
+            agp_data.unitary_residual_norm,
+    }
 
-    return t, traj, rho_t, rho_ss_t
+    return t, traj, rho_t, rho_ss_t, diagnostics
+
+
+# def approx_CD_trajectory(
+#     model,
+#     s_of_t,
+#     times,
+#     hamiltonians,
+#     jump_operators,
+#     *,
+#     dim=2,
+#     vec_order="F",
+#     lam_unitary=0.0,
+#     lam_dissipative=0.0,
+# ):
+#     """
+#     Evolve the instantaneous steady state under the approximate
+#     counterdiabatic Lindbladian
+
+#         L_CD(t) = L(s(t)) + sdot(t) A_s.
+
+#     Here `model` is interpreted as a function of s:
+#         model.H(s)
+#         model.jumps(s)
+
+#     The AGP is calculated variationally on the supplied time grid
+#     and linearly interpolated between grid points.
+
+#     Returns
+#     -------
+#     t : ndarray
+#         Time grid.
+
+#     traj : Trajectory
+#         Trajectory object from LindbladEvolver.
+
+#     rho_t : ndarray, shape (nt, d, d)
+#         CD-evolved density matrices.
+
+#     rho_ss_t : ndarray, shape (nt, d, d)
+#         Instantaneous steady states rho_ss(s(t)).
+#     """
+
+#     # --------------------------------------------------
+#     # Grid and builder
+#     # --------------------------------------------------
+
+#     t = np.asarray(times, dtype=float)
+#     s_t = np.array([s_of_t(tt) for tt in t], dtype=float)
+
+#     builder = LiouvillianBuilder(
+#         dim=dim,
+#         vec_order=vec_order,
+#     )
+
+#     # --------------------------------------------------
+#     # Instantaneous steady states
+#     # --------------------------------------------------
+
+#     rho_ss_t = np.array([
+#         get_steady_state(builder, model, s)
+#         for s in s_t
+#     ])
+
+#     # partial_s rho_ss and sdot
+#     drho_ds_t = np.gradient(
+#         rho_ss_t,
+#         s_t,
+#         axis=0,
+#         edge_order=2 if len(t) >= 3 else 1,
+#     )
+
+#     sdot_t = np.gradient(
+#         s_t,
+#         t,
+#         edge_order=2 if len(t) >= 3 else 1,
+#     )
+
+#     # --------------------------------------------------
+#     # Variational AGP on the grid
+#     # --------------------------------------------------
+
+#     H_agp_t = []
+#     gamma_agp_t = []
+
+#     for rho_ss, drho_ds in zip(rho_ss_t, drho_ds_t):
+
+#         _, gamma, _, details = fit_overall_AGP(
+#             rho_ss=rho_ss,
+#             partial_s_rho_ss=drho_ds,
+#             hamiltonians=hamiltonians,
+#             jump_operators=jump_operators,
+#             lam_unitary=lam_unitary,
+#             lam_dissipative=lam_dissipative,
+#             return_details=True,
+#         )
+
+#         H_agp_t.append(details["H_agp"])
+#         gamma_agp_t.append(gamma)
+
+#     H_agp_t = np.asarray(H_agp_t)
+#     gamma_agp_t = np.asarray(gamma_agp_t)
+
+#     # --------------------------------------------------
+#     # Linear interpolation
+#     # --------------------------------------------------
+
+#     def interp(tt, values):
+#         if tt <= t[0]:
+#             return values[0]
+#         if tt >= t[-1]:
+#             return values[-1]
+
+#         k = np.searchsorted(t, tt) - 1
+#         a = (tt - t[k]) / (t[k + 1] - t[k])
+
+#         return (1 - a) * values[k] + a * values[k + 1]
+
+#     # --------------------------------------------------
+#     # CD model:
+#     #
+#     # H -> H + sdot H_AGP
+#     # gamma_j -> sdot gamma_j
+#     # --------------------------------------------------
+
+#     def H_CD_of_t(tt):
+
+#         s = s_of_t(tt)
+#         sdot = interp(tt, sdot_t)
+#         H_agp = interp(tt, H_agp_t)
+
+#         return model.H(s) + sdot * H_agp
+
+#     def jumps_CD_of_t(tt):
+
+#         s = s_of_t(tt)
+#         sdot = interp(tt, sdot_t)
+#         gamma = interp(tt, gamma_agp_t)
+
+#         # Original physical jumps
+#         jumps = list(model.jumps(s))
+
+#         # Counterdiabatic dissipative terms
+#         jumps += [
+#             Jump(L, sdot * g)
+#             for L, g in zip(jump_operators, gamma)
+#         ]
+
+#         return jumps
+
+#     CD_model = LindbladModel2LS(
+#         H_CD_of_t,
+#         jumps_CD_of_t,
+#     )
+
+#     # --------------------------------------------------
+#     # Start in rho_ss(s(t0)) and use existing evolver
+#     # --------------------------------------------------
+
+#     rho0 = rho_ss_t[0]
+
+#     evolver = LindbladEvolver(
+#         CD_model,
+#         builder,
+#     )
+
+#     traj = evolver.simulate(
+#         rho0,
+#         t,
+#     )
+
+#     # Density matrices along the actual CD trajectory
+#     rho_t = np.array([
+#         traj.rho(k)
+#         for k in range(len(traj.t))
+#     ])
+
+#     return t, traj, rho_t, rho_ss_t
