@@ -93,8 +93,8 @@ cols=["#B23A48","#3A7D44","#3A5FCD"]
 a2=[ax[1].plot([],[],[], lw=1.2, alpha=.45, color=c)[0] for c in cols]
 p=[A.plot([],[],[],"o", ms=6.6, color=ORANGE)[0] for A in ax]
 tr=[Line3DCollection(dummy, linewidths=2.3) for _ in range(2)]
-ax[0].add_collection3d(tr[0], autolim=False)
-ax[1].add_collection3d(tr[1], autolim=False)
+ax[0].add_collection3d(tr[0])
+ax[1].add_collection3d(tr[1])
 txt=ax[2].text2D(0.03,0.97,"", transform=ax[2].transAxes, va="top", ha="left",
                  bbox=dict(facecolor="white", edgecolor="none", alpha=.88, pad=1.8))
 
